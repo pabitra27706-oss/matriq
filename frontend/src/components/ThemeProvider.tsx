@@ -1,66 +1,95 @@
 "use client";
-import React, {
-  createContext,
-  useContext,
-  useEffect,
-  useState,
-  useCallback,
-} from "react";
+import React, { createContext, useContext, useEffect, useState, useCallback } from "react";
 
+/* ══════════════════════════════════════════════════════════════════ */
+/* THEME CONTEXT                                                     */
+/* ══════════════════════════════════════════════════════════════════ */
 type Theme = "light" | "dark";
 
-const ThemeCtx = createContext<{ theme: Theme; toggle: () => void }>({
+interface ThemeContextValue {
+  theme: Theme;
+  toggle: () => void;
+  isDark: boolean;
+  isLight: boolean;
+}
+
+const ThemeCtx = createContext<ThemeContextValue>({
   theme: "dark",
   toggle: () => {},
+  isDark: true,
+  isLight: false,
 });
 
 export const useTheme = () => useContext(ThemeCtx);
 
+/* ══════════════════════════════════════════════════════════════════ */
+/* APPLY THEME TO DOM                                                */
+/* ══════════════════════════════════════════════════════════════════ */
 function applyTheme(t: Theme) {
   const root = document.documentElement;
-  root.classList.remove("dark", "light");
-  root.classList.add(t);
+  if (t === "dark") {
+    root.classList.add("dark");
+    root.classList.remove("light");
+  } else {
+    root.classList.remove("dark");
+    root.classList.add("light");
+  }
+  const metaTheme = document.querySelector('meta[name="theme-color"]');
+  if (metaTheme) {
+    metaTheme.setAttribute("content", t === "dark" ? "#050508" : "#ffffff");
+  }
 }
 
-export default function ThemeProvider({
-  children,
-}: {
-  children: React.ReactNode;
-}) {
+/* ══════════════════════════════════════════════════════════════════ */
+/* STORAGE KEY                                                       */
+/* ══════════════════════════════════════════════════════════════════ */
+const STORAGE_KEY = "matriq-theme";
+
+/* ══════════════════════════════════════════════════════════════════ */
+/* PROVIDER                                                          */
+/* ══════════════════════════════════════════════════════════════════ */
+export default function ThemeProvider({ children }: { children: React.ReactNode }) {
+  // CHANGED: Always start with dark, never read from localStorage on init
   const [theme, setTheme] = useState<Theme>("dark");
   const [mounted, setMounted] = useState(false);
 
+  // Initialize — ALWAYS dark on first load
   useEffect(() => {
-    const saved = localStorage.getItem("bi-theme") as Theme | null;
-    const systemDark = window.matchMedia(
-      "(prefers-color-scheme: dark)"
-    ).matches;
-    const initial: Theme = saved || (systemDark ? "dark" : "light");
-    setTheme(initial);
-    applyTheme(initial);
+    applyTheme("dark");
+    setTheme("dark");
     setMounted(true);
   }, []);
 
+  // Listen for system preference changes — disabled since we always default dark
+  // Users can still toggle manually via the button
+
+  // Toggle
   const toggle = useCallback(() => {
     const next: Theme = theme === "dark" ? "light" : "dark";
     setTheme(next);
     applyTheme(next);
-    localStorage.setItem("bi-theme", next);
+    try {
+      localStorage.setItem(STORAGE_KEY, next);
+    } catch {
+      // Silently fail if storage is unavailable
+    }
   }, [theme]);
 
-  // Prevent flash: render children immediately but theme-dependent
-  // UI won't mismatch because the <script> in layout.tsx already
-  // set the class before React hydrates.
+  // Derived values
+  const isDark = theme === "dark";
+  const isLight = theme === "light";
+
+  // Prevent flash
   if (!mounted) {
     return (
-      <ThemeCtx.Provider value={{ theme: "dark", toggle }}>
+      <ThemeCtx.Provider value={{ theme: "dark", toggle, isDark: true, isLight: false }}>
         {children}
       </ThemeCtx.Provider>
     );
   }
 
   return (
-    <ThemeCtx.Provider value={{ theme, toggle }}>
+    <ThemeCtx.Provider value={{ theme, toggle, isDark, isLight }}>
       {children}
     </ThemeCtx.Provider>
   );

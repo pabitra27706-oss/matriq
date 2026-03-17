@@ -1,3 +1,4 @@
+# backend/routes/query.py
 import os
 import time
 import hashlib
@@ -13,7 +14,9 @@ from models.schemas import (
     TablesResponse, TableInfo, ActiveTableRequest,
     UploadResponse, UploadPreviewResponse,
 )
-from services.prompt_builder import build_prompt, build_modification_prompt, build_fix_prompt
+from services.prompt_builder import (
+    build_prompt, build_modification_prompt, build_fix_prompt,
+)
 from services.gemini_service import query_gemini
 from services.db_service import (
     execute_query, execute_kpi_sql, get_schema, load_csv_to_db,
@@ -36,7 +39,10 @@ CACHE_TTL = settings.CACHE_TTL
 MAX_SELF_CORRECT_RETRIES = 2
 
 
-# ── cache helpers ─────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# CACHE HELPERS (unchanged)
+# ═══════════════════════════════════════════════════════════════
+
 def _cache_key(query_text: str, active_tbl: str) -> str:
     raw = f"{query_text.strip().lower()}|{active_tbl}"
     return hashlib.sha256(raw.encode()).hexdigest()
@@ -65,7 +71,10 @@ def _put_cache(key: str, resp: QueryResponse) -> None:
     _cache[key] = {"resp": resp, "ts": time.time()}
 
 
-# ── response builder helpers ──────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# RESPONSE BUILDER HELPERS (unchanged)
+# ═══════════════════════════════════════════════════════════════
+
 def _parse_chart_config(cc: Any) -> ChartConfig:
     if not isinstance(cc, dict):
         cc = {}
@@ -84,7 +93,9 @@ def _parse_chart_config(cc: Any) -> ChartConfig:
         group_by=cc.get("group_by"),
         colors=cc.get("colors", ["#6366F1", "#8B5CF6", "#EC4899", "#F43F5E"]),
         annotations=[
-            Annotation(**a) for a in cc.get("annotations", []) if isinstance(a, dict)
+            Annotation(**a)
+            for a in cc.get("annotations", [])
+            if isinstance(a, dict)
         ],
     )
 
@@ -108,7 +119,9 @@ def _parse_additional_charts(raw: list, fallback_x: str) -> List[ChartConfig]:
                 y_axis=ac_y,
                 y_label=str(ac.get("y_label", "")),
                 group_by=ac.get("group_by"),
-                colors=ac.get("colors", ["#6366F1", "#8B5CF6", "#EC4899"]),
+                colors=ac.get(
+                    "colors", ["#6366F1", "#8B5CF6", "#EC4899"]
+                ),
                 annotations=[
                     Annotation(**a)
                     for a in ac.get("annotations", [])
@@ -136,7 +149,9 @@ def _parse_kpis(raw: list) -> List[KPI]:
                     value=str(val) if val else "N/A",
                     icon=str(k.get("icon", "bar-chart") or "bar-chart"),
                     trend=str(k["trend"]) if k.get("trend") else None,
-                    trend_direction=str(k.get("trend_direction") or "neutral"),
+                    trend_direction=str(
+                        k.get("trend_direction") or "neutral"
+                    ),
                 )
             )
         except Exception as e:
@@ -153,7 +168,9 @@ def _build_response_from_gemini(
     total_time: float,
     is_mod: bool = False,
 ) -> QueryResponse:
-    chart_config = _parse_chart_config(gemini_result.get("chart_config", {}))
+    chart_config = _parse_chart_config(
+        gemini_result.get("chart_config", {})
+    )
 
     if data and not chart_config.x_axis:
         keys = list(data[0].keys())
@@ -195,7 +212,10 @@ def _build_response_from_gemini(
     )
 
 
-# ── UPDATE 5: agentic self-correction ─────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# SELF-CORRECTION (unchanged)
+# ═══════════════════════════════════════════════════════════════
+
 def _execute_with_self_correction(
     sql: str,
     user_query: str,
@@ -203,12 +223,10 @@ def _execute_with_self_correction(
     gemini_result: dict,
     t0: float,
 ) -> QueryResponse:
-    """Try to execute *sql*. On failure, ask Gemini to fix it up to N times."""
     last_error = ""
 
     for attempt in range(MAX_SELF_CORRECT_RETRIES + 1):
         try:
-            # Column validation
             col_ok, col_err, valid_cols = validate_sql_columns(sql, active)
             if not col_ok:
                 raise ValueError(col_err)
@@ -237,25 +255,31 @@ def _execute_with_self_correction(
                         if valid:
                             sql = new_sql
                             gemini_result = fixed
-                            logger.info(f"Self-corrected SQL (attempt {attempt + 1})")
+                            logger.info(
+                                f"Self-corrected SQL (attempt {attempt + 1})"
+                            )
                             continue
                 except Exception as fix_err:
-                    logger.warning(f"Self-correction call failed: {fix_err}")
+                    logger.warning(
+                        f"Self-correction call failed: {fix_err}"
+                    )
             break
 
-    # All retries exhausted
     return QueryResponse(
         success=False,
         query=user_query,
         sql=sql,
-        error=f"Query failed after {MAX_SELF_CORRECT_RETRIES + 1} attempts: {last_error}",
+        error=(
+            f"Query failed after {MAX_SELF_CORRECT_RETRIES + 1} "
+            f"attempts: {last_error}"
+        ),
         execution_time=round(time.perf_counter() - t0, 3),
     )
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# ENDPOINTS
-# ══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+# QUERY ENDPOINT (unchanged)
+# ═══════════════════════════════════════════════════════════════
 
 @router.post("/query", response_model=QueryResponse)
 @limiter.limit(settings.QUERY_RATE_LIMIT)
@@ -265,7 +289,7 @@ def process_query(req: QueryRequest, request: Request):
     active = req.active_table or _active_table or settings.DEFAULT_TABLE
     logger.info(f"Query: '{req.query[:80]}' | table={active}")
 
-    # ── 1. conversational shortcut ────────────────────────────────────────
+    # 1. conversational
     if is_conversational(req.query):
         conv = get_conversational_response(req.query)
         if conv:
@@ -279,18 +303,18 @@ def process_query(req: QueryRequest, request: Request):
                 cache_hit=False,
             )
 
-    # ── 2. modification detection (UPDATE 6) ──────────────────────────────
+    # 2. modification
     is_mod = False
     if req.conversation_history and is_modification_request(req.query):
         is_mod = True
-        # Pure chart-type switch can be handled client-side; here we handle
-        # SQL-level modifications by using build_modification_prompt.
-        prev = req.conversation_history[-1] if req.conversation_history else {}
+        prev = (
+            req.conversation_history[-1] if req.conversation_history else {}
+        )
         prev_sql = prev.get("sql", "")
         prev_chart = prev.get("chart_config")
 
         if prev_sql:
-            logger.info("Detected modification request — using modification prompt")
+            logger.info("Detected modification request")
             try:
                 prompt = build_modification_prompt(
                     req.query, prev_sql, prev_chart, active_table=active
@@ -303,7 +327,9 @@ def process_query(req: QueryRequest, request: Request):
                         return QueryResponse(
                             success=False, query=req.query, sql=sql,
                             error=f"Invalid SQL: {err}",
-                            execution_time=round(time.perf_counter() - t0, 3),
+                            execution_time=round(
+                                time.perf_counter() - t0, 3
+                            ),
                         )
                     resp = _execute_with_self_correction(
                         sql, req.query, active, gemini_result, t0
@@ -311,10 +337,12 @@ def process_query(req: QueryRequest, request: Request):
                     resp.is_modification = True
                     return resp
             except Exception as e:
-                logger.warning(f"Modification prompt failed, falling through: {e}")
-                is_mod = False  # fall through to normal path
+                logger.warning(
+                    f"Modification prompt failed, falling through: {e}"
+                )
+                is_mod = False
 
-    # ── 3. cache lookup ───────────────────────────────────────────────────
+    # 3. cache
     skip_cache = _should_skip_cache(req.query)
     cache_key = _cache_key(req.query, active)
     if not skip_cache:
@@ -326,7 +354,7 @@ def process_query(req: QueryRequest, request: Request):
             copy.timestamp = datetime.utcnow().isoformat()
             return copy
 
-    # ── 4. normal Gemini flow ─────────────────────────────────────────────
+    # 4. normal flow
     try:
         prompt = build_prompt(
             req.query, req.conversation_history, active_table=active
@@ -335,12 +363,19 @@ def process_query(req: QueryRequest, request: Request):
         sql = gemini_result.get("sql", "")
 
         if not sql:
-            # Gemini said "data not available" — relay the insight
             return QueryResponse(
                 success=True, query=req.query, sql="",
                 data=[], chart_config=None, additional_charts=[],
-                insight=str(gemini_result.get("insight", "I could not generate a query for that. Try rephrasing.")),
-                kpis=[], follow_up_questions=gemini_result.get("follow_up_questions", []),
+                insight=str(
+                    gemini_result.get(
+                        "insight",
+                        "I could not generate a query. Try rephrasing.",
+                    )
+                ),
+                kpis=[],
+                follow_up_questions=gemini_result.get(
+                    "follow_up_questions", []
+                ),
                 execution_time=round(time.perf_counter() - t0, 3),
                 confidence=gemini_result.get("confidence"),
                 assumptions=gemini_result.get("assumptions", []),
@@ -374,7 +409,10 @@ def process_query(req: QueryRequest, request: Request):
         )
 
 
-# ── schema / suggestions ─────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# SCHEMA / SUGGESTIONS (unchanged)
+# ═══════════════════════════════════════════════════════════════
+
 @router.get("/schema", response_model=SchemaResponse)
 def schema_info():
     info = get_schema()
@@ -384,36 +422,60 @@ def schema_info():
 @router.get("/suggestions", response_model=SuggestionResponse)
 def suggestions():
     items = [
-        {"query": "Show me the total views by category", "difficulty": "Simple",
-         "description": "Bar chart of aggregated views per category"},
-        {"query": "Compare average likes, comments, and shares for monetized vs non-monetized videos across regions",
-         "difficulty": "Medium",
-         "description": "Grouped bar chart with multiple engagement metrics"},
-        {"query": "Show me the monthly trend of average sentiment score for the top 3 categories by views in 2025",
-         "difficulty": "Complex",
-         "description": "Multi-line time series chart with annotations"},
-        {"query": "What is the distribution of videos across languages?",
-         "difficulty": "Simple",
-         "description": "Pie chart of video count by language"},
-        {"query": "Which region has the highest engagement rate?",
-         "difficulty": "Medium",
-         "description": "Engagement = (likes+comments+shares)/views"},
-        {"query": "Show monthly video publish trends by category for 2024",
-         "difficulty": "Medium",
-         "description": "Multi-line time series chart"},
+        {
+            "query": "Show me the total views by category",
+            "difficulty": "Simple",
+            "description": "Bar chart of aggregated views per category",
+        },
+        {
+            "query": (
+                "Compare average likes, comments, and shares for "
+                "monetized vs non-monetized videos across regions"
+            ),
+            "difficulty": "Medium",
+            "description": "Grouped bar chart with multiple engagement metrics",
+        },
+        {
+            "query": (
+                "Show me the monthly trend of average sentiment score "
+                "for the top 3 categories by views in 2025"
+            ),
+            "difficulty": "Complex",
+            "description": "Multi-line time series chart with annotations",
+        },
+        {
+            "query": "What is the distribution of videos across languages?",
+            "difficulty": "Simple",
+            "description": "Pie chart of video count by language",
+        },
+        {
+            "query": "Which region has the highest engagement rate?",
+            "difficulty": "Medium",
+            "description": "Engagement = (likes+comments+shares)/views",
+        },
+        {
+            "query": "Show monthly video publish trends by category for 2024",
+            "difficulty": "Medium",
+            "description": "Multi-line time series chart",
+        },
     ]
     return SuggestionResponse(suggestions=items)
 
 
-# ── table management ──────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# TABLE MANAGEMENT (unchanged)
+# ═══════════════════════════════════════════════════════════════
+
 @router.get("/tables", response_model=TablesResponse)
 def list_tables():
     global _active_table
     info = get_schema()
     tables = [
         TableInfo(
-            name=t["name"], row_count=t["row_count"],
-            column_count=len(t["columns"]), columns=t["columns"],
+            name=t["name"],
+            row_count=t["row_count"],
+            column_count=len(t["columns"]),
+            columns=t["columns"],
             is_active=(t["name"] == _active_table),
         )
         for t in info["tables"]
@@ -439,7 +501,9 @@ def set_active_table(body: ActiveTableRequest):
 def delete_table_endpoint(table_name: str):
     global _active_table
     if table_name == "youtube_data":
-        raise HTTPException(400, "Cannot delete the default youtube_data table")
+        raise HTTPException(
+            400, "Cannot delete the default youtube_data table"
+        )
     if not table_exists(table_name):
         raise HTTPException(404, f"Table '{table_name}' does not exist")
     drop_table(table_name)
@@ -448,8 +512,10 @@ def delete_table_endpoint(table_name: str):
     info = get_schema()
     tables = [
         TableInfo(
-            name=t["name"], row_count=t["row_count"],
-            column_count=len(t["columns"]), columns=t["columns"],
+            name=t["name"],
+            row_count=t["row_count"],
+            column_count=len(t["columns"]),
+            columns=t["columns"],
             is_active=(t["name"] == _active_table),
         )
         for t in info["tables"]
@@ -457,43 +523,121 @@ def delete_table_endpoint(table_name: str):
     return TablesResponse(tables=tables, active_table=_active_table)
 
 
-# ── upload with auto-profiling (UPDATE 9) ─────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# UPLOAD — 100MB, AUTO ENCODING, AUTO DELIMITER, NO ROW LIMIT
+# ═══════════════════════════════════════════════════════════════
+
 @router.post("/upload", response_model=UploadResponse)
 @limiter.limit(settings.UPLOAD_RATE_LIMIT)
-async def upload_csv(
+async def upload_csv_endpoint(
     request: Request,
     file: UploadFile = File(...),
     table_name: str = Form("custom_data"),
+    encoding: Optional[str] = Form(None),
+    delimiter: Optional[str] = Form(None),
 ):
+    """
+    Upload CSV/TSV/TXT file.
+    - Max 100MB
+    - Auto-detects encoding (UTF-8, Latin-1, CP1252, Shift_JIS, etc.)
+    - Auto-detects delimiter (, ; TAB |)
+    - User can override encoding and delimiter via form fields
+    - No row limit — loads all rows in chunks
+    - Handles 1M+ row files
+    """
     global _active_table
-    filename = file.filename or ""
-    if not filename.lower().endswith(".csv"):
+    filename = file.filename or "unknown.csv"
+
+    # ── Validate extension ──
+    allowed = {".csv", ".tsv", ".txt"}
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in allowed:
         return UploadResponse(
             success=False,
-            error=f"Invalid file type. Only .csv allowed. Got: '{filename}'",
+            error=(
+                f"Invalid file type '{ext}'. "
+                f"Allowed: {', '.join(sorted(allowed))}"
+            ),
         )
+
+    # ── Read all content ──
     content = await file.read()
-    if len(content) > settings.MAX_UPLOAD_SIZE:
+
+    # ── Size check — 100MB ──
+    max_size = int(os.getenv("MAX_UPLOAD_SIZE", str(100 * 1024 * 1024)))
+    if len(content) > max_size:
+        size_mb = len(content) / (1024 * 1024)
+        max_mb = max_size / (1024 * 1024)
         return UploadResponse(
             success=False,
-            error=f"File too large ({len(content)/(1024*1024):.1f}MB). Max {settings.MAX_UPLOAD_SIZE//(1024*1024)}MB.",
+            error=f"File too large ({size_mb:.1f}MB). Maximum {max_mb:.0f}MB.",
         )
+
     if len(content) == 0:
         return UploadResponse(success=False, error="File is empty.")
 
+    # ── Content validation ──
+    try:
+        from services.upload_service import (
+            validate_csv_content,
+            sanitize_table_name,
+            detect_encoding as _detect_enc,
+            detect_delimiter as _detect_delim,
+            decode_content,
+        )
+
+        is_valid, error_msg, metadata = validate_csv_content(
+            content, encoding, max_size
+        )
+        if not is_valid:
+            return UploadResponse(success=False, error=error_msg)
+
+        detected_encoding = encoding or metadata.get("encoding", "utf-8")
+        detected_delimiter = delimiter or metadata.get("delimiter", ",")
+        safe_table = sanitize_table_name(table_name)
+
+    except ImportError:
+        # Fallback if upload_service not available
+        detected_encoding = encoding or "utf-8"
+        detected_delimiter = delimiter or ","
+        safe_table = table_name.replace(".csv", "").replace(" ", "_")[:64]
+        metadata = {}
+
+    # Handle TSV
+    if ext == ".tsv" and delimiter is None:
+        detected_delimiter = "\t"
+
+    # ── Save temp file ──
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
-    filepath = os.path.join(settings.UPLOAD_DIR, filename)
+    tmp_name = f"{safe_table}_{os.urandom(4).hex()}{ext}"
+    filepath = os.path.join(settings.UPLOAD_DIR, tmp_name)
+
     with open(filepath, "wb") as f:
         f.write(content)
 
-    safe_table = table_name.replace(".csv", "").replace(" ", "_")[:64]
     try:
-        schema = load_csv_to_db(filepath, safe_table)
+        # ── Load into database — no row limit ──
+        schema = load_csv_to_db(
+            filepath,
+            safe_table,
+            encoding=detected_encoding,
+            delimiter=detected_delimiter,
+        )
         _active_table = safe_table
 
-        # Auto-profiling
-        prof = profile_table(safe_table)
-        starter_qs = generate_starter_questions(prof)
+        # ── Auto-profiling for suggested questions ──
+        try:
+            prof = profile_table(safe_table)
+            starter_qs = generate_starter_questions(prof)
+        except Exception:
+            starter_qs = []
+
+        file_size_mb = len(content) / (1024 * 1024)
+        logger.info(
+            f"Upload OK: '{filename}' → '{safe_table}' "
+            f"({file_size_mb:.1f}MB, enc={detected_encoding}, "
+            f"delim={'TAB' if detected_delimiter == chr(9) else repr(detected_delimiter)})"
+        )
 
         return UploadResponse(
             success=True,
@@ -501,36 +645,113 @@ async def upload_csv(
             schema_info=schema,
             suggested_questions=starter_qs,
         )
+
     except Exception as e:
         logger.error(f"Upload failed: {e}")
+        traceback.print_exc()
         return UploadResponse(success=False, error=str(e))
 
+    finally:
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception:
+            pass
+
+
+# ═══════════════════════════════════════════════════════════════
+# UPLOAD PREVIEW
+# ═══════════════════════════════════════════════════════════════
 
 @router.post("/upload/preview", response_model=UploadPreviewResponse)
 @limiter.limit(settings.UPLOAD_RATE_LIMIT)
 async def upload_preview_endpoint(
-    request: Request, file: UploadFile = File(...)
+    request: Request,
+    file: UploadFile = File(...),
+    encoding: Optional[str] = Form(None),
+    delimiter: Optional[str] = Form(None),
 ):
-    filename = file.filename or ""
-    if not filename.lower().endswith(".csv"):
-        return UploadPreviewResponse(
-            success=False, error="Invalid file type. Only .csv allowed."
-        )
-    content = await file.read()
-    if len(content) > settings.MAX_UPLOAD_SIZE:
+    """
+    Preview uploaded file before confirming.
+    Shows first 5 rows, column types, total row count, detected encoding.
+    """
+    filename = file.filename or "unknown.csv"
+
+    # ── Validate extension ──
+    allowed = {".csv", ".tsv", ".txt"}
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in allowed:
         return UploadPreviewResponse(
             success=False,
-            error=f"File too large ({len(content)/(1024*1024):.1f}MB).",
+            error=(
+                f"Invalid file type '{ext}'. "
+                f"Allowed: {', '.join(sorted(allowed))}"
+            ),
         )
+
+    # ── Read content ──
+    content = await file.read()
+    max_size = int(os.getenv("MAX_UPLOAD_SIZE", str(100 * 1024 * 1024)))
+    if len(content) > max_size:
+        return UploadPreviewResponse(
+            success=False,
+            error=(
+                f"File too large ({len(content) / (1024 * 1024):.1f}MB). "
+                f"Maximum {max_size / (1024 * 1024):.0f}MB."
+            ),
+        )
+
+    if len(content) == 0:
+        return UploadPreviewResponse(
+            success=False, error="File is empty."
+        )
+
+    # ── Auto-detect encoding ──
+    detected_encoding = encoding
+    if detected_encoding is None:
+        try:
+            from services.upload_service import detect_encoding as _det
+            detected_encoding, _ = _det(content[:100000])
+        except Exception:
+            detected_encoding = "utf-8"
+
+    # ── Auto-detect delimiter ──
+    detected_delimiter = delimiter
+    if detected_delimiter is None:
+        if ext == ".tsv":
+            detected_delimiter = "\t"
+        else:
+            try:
+                from services.upload_service import detect_delimiter as _dd
+                text_sample = content[:20000].decode(
+                    detected_encoding, errors="replace"
+                )
+                detected_delimiter = _dd(text_sample)
+            except Exception:
+                detected_delimiter = ","
+
+    # ── Save temp file ──
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
-    tmp_path = os.path.join(settings.UPLOAD_DIR, f"_preview_{filename}")
+    tmp_path = os.path.join(
+        settings.UPLOAD_DIR, f"_preview_{os.urandom(4).hex()}{ext}"
+    )
+
     with open(tmp_path, "wb") as f:
         f.write(content)
+
     try:
-        info = preview_csv(tmp_path)
+        info = preview_csv(
+            tmp_path,
+            encoding=detected_encoding,
+            delimiter=detected_delimiter,
+        )
+
         return UploadPreviewResponse(
-            success=True, file_name=filename, file_size=len(content),
-            row_count=info["row_count"], columns=info["columns"],
+            success=True,
+            file_name=filename,
+            file_size=len(content),
+            row_count=info["row_count"],
+            columns=info["columns"],
             sample_rows=info["sample_rows"],
         )
     except Exception as e:
@@ -538,6 +759,7 @@ async def upload_preview_endpoint(
         return UploadPreviewResponse(success=False, error=str(e))
     finally:
         try:
-            os.remove(tmp_path)
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
         except Exception:
             pass
