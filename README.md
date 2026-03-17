@@ -54,13 +54,6 @@ User Question (Natural Language)
 - Follow-up questions with conversational context
 - CSV upload for custom datasets
 
-## Dataset
-
-- **Source**: YouTube video analytics
-- **Size**: 1,000,000 rows
-- **Columns**: video_id, title, category, region, language, views, likes, comments, shares, ads_enabled, publish_date, sentiment_score, duration_seconds, subscribers
-- **Categories**: Coding, Education, Gaming, Music, Tech Reviews, Vlogs
-- **Date Range**: 2024-01-01 to 2025-12-30
 
 ## Quick Start
 
@@ -282,7 +275,7 @@ npm run test   # Run tests
 
 ## Team
 
-Built for Hackathon 2025
+Built for Hackathon 2026
 
 ## License
 
