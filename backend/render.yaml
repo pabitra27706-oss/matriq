@@ -1,29 +1,17 @@
+@"
 services:
   - type: web
     name: matriq-backend
     runtime: python
-    region: oregon
     plan: free
+    pythonVersion: 3.11.0
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    startCommand: uvicorn main:app --host 0.0.0.0 --port \$PORT
     envVars:
       - key: GEMINI_API_KEY
         sync: false
-      - key: GEMINI_MODEL
-        value: gemini-3.1-flash-lite-preview
       - key: CORS_ORIGINS
         value: https://matriq-frontend.vercel.app,http://localhost:3000
-      - key: FRONTEND_URL
-        value: https://matriq-frontend.vercel.app
       - key: ENVIRONMENT
         value: production
-      - key: QUERY_RATE_LIMIT
-        value: 30/minute
-      - key: UPLOAD_RATE_LIMIT
-        value: 10/minute
-      - key: MAX_UPLOAD_SIZE
-        value: 104857600
-    disk:
-      name: uploads
-      mountPath: /opt/render/project/src/data/uploads
-      sizeGB: 1
+"@ | Out-File -FilePath render.yaml -Encoding UTF8 -Force
