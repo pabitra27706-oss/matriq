@@ -11,11 +11,6 @@ DB_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "database.db"
 )
 
-DANGEROUS_PATTERN = re.compile(
-    r"\b(DROP|DELETE|UPDATE|INSERT|ALTER|CREATE|ATTACH|DETACH|PRAGMA|VACUUM|REPLACE)\b",
-    re.IGNORECASE,
-)
-
 
 # ═══════════════════════════════════════════════════════════════
 # CONNECTION
@@ -26,30 +21,152 @@ def get_connection(readonly=True):
     conn.row_factory = sqlite3.Row
     if readonly:
         try:
-            conn.execute("PRAGMA query_only = ON;")
+            conn.execute("PRAGMA query_only = ON;")   # 2nd safety net
         except Exception:
             pass
     return conn
 
 
 # ═══════════════════════════════════════════════════════════════
-# SQL VALIDATION
+# SQL CLEANING HELPERS
 # ═══════════════════════════════════════════════════════════════
 
-def validate_sql(sql):
-    cleaned = sql.strip().rstrip(";")
+def _strip_markdown_sql(sql: str) -> str:
+    """
+    Remove markdown code-block wrappers that LLMs add.
+       ```sql\nSELECT …\n```   →   SELECT …
+       ```\nSELECT …\n```      →   SELECT …
+    """
+    s = sql.strip()
+    if s.startswith("```"):
+        lines = s.split("\n")
+        # drop opening ``` or ```sql
+        if lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        # drop closing ```
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        s = "\n".join(lines).strip()
+    return s
+
+
+def _strip_sql_comments(sql: str) -> str:
+    """Remove -- single-line and /* block */ comments for keyword analysis."""
+    sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
+    sql = re.sub(r"--[^\n]*", " ", sql)
+    return sql.strip()
+
+
+def _neutralize_string_literals(sql: str) -> str:
+    """
+    Replace 'string literals' with placeholders so keywords
+    INSIDE strings don't trigger false positives.
+        WHERE note = 'DROP TABLE' → WHERE note = '__LIT__'
+    """
+    return re.sub(r"'[^']*'", "'__LIT__'", sql)
+
+
+# ═══════════════════════════════════════════════════════════════
+# DANGEROUS-STATEMENT PATTERN  (context-aware)
+#
+#   ✅  REPLACE(col,'a','b')         — string function, SAFE
+#   ✅  last_updated, create_date    — column names,    SAFE
+#   ✅  'DROP TABLE' inside strings  — literal text,    SAFE
+#   ❌  DROP TABLE videos            — DDL statement,   BLOCKED
+#   ❌  DELETE FROM videos           — DML statement,   BLOCKED
+#   ❌  INSERT INTO videos           — DML statement,   BLOCKED
+#   ❌  UPDATE videos SET …          — DML statement,   BLOCKED
+#   ❌  REPLACE INTO videos          — upsert,          BLOCKED
+#   ❌  ATTACH DATABASE …            — DB escape,       BLOCKED
+# ═══════════════════════════════════════════════════════════════
+
+DANGEROUS_PATTERN = re.compile(
+    r"""
+    \b(
+        DROP      \s+ (TABLE|INDEX|VIEW|TRIGGER|DATABASE)
+      | DELETE    \s+ FROM
+      | UPDATE    \s+ \w+ \s+ SET \b
+      | INSERT    \s+ (INTO|OR\s)
+      | REPLACE   \s+ INTO
+      | ALTER     \s+ (TABLE|INDEX|VIEW)
+      | CREATE    \s+ (TABLE|INDEX|VIEW|TRIGGER|TEMP|TEMPORARY|VIRTUAL|DATABASE)
+      | ATTACH    \b
+      | DETACH    \b
+      | PRAGMA    \b
+      | VACUUM    \b
+      | REINDEX   \b
+      | \.load    \b
+      | \.import  \b
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+# ═══════════════════════════════════════════════════════════════
+# SQL VALIDATION  — secure BUT flexible
+#
+#  ALLOWED (read-only analytics):
+#    SELECT …
+#    WITH cte AS (…) SELECT …
+#    (SELECT …) — subquery wrapper
+#    SELECT REPLACE(col,'a','b') …
+#    SELECT … FROM t WHERE col = 'DROP TABLE'
+#    -- comment\n SELECT …
+#
+#  BLOCKED (writes / side-effects):
+#    DROP / DELETE / UPDATE / INSERT / ALTER / CREATE
+#    ATTACH / DETACH / PRAGMA / VACUUM
+#    Multiple statements (;)
+# ═══════════════════════════════════════════════════════════════
+
+def validate_sql(sql: str) -> Tuple[bool, str]:
+    # ── 1. Strip markdown fences ──
+    cleaned = _strip_markdown_sql(sql)
+    cleaned = cleaned.strip().rstrip(";")
+
     if not cleaned:
         return False, "Empty SQL query."
-    if not cleaned.upper().startswith("SELECT"):
+
+    # ── 2. First real keyword (skip comments + whitespace) ──
+    bare = _strip_sql_comments(cleaned).strip()
+    if not bare:
+        return False, "Empty SQL query after removing comments."
+
+    first_word = bare.split()[0].upper()
+
+    # ── 3. Must begin with SELECT | WITH (CTE) | ( (sub-query) ──
+    if first_word not in ("SELECT", "WITH", "EXPLAIN") and not bare.startswith("("):
         return False, "Only SELECT statements are allowed."
-    if DANGEROUS_PATTERN.search(cleaned):
-        return False, "Query contains forbidden keywords."
-    if cleaned.count(";") > 0:
-        return False, "Multiple statements not allowed."
+
+    # ── 4. WITH must contain a SELECT somewhere ──
+    if first_word == "WITH":
+        if not re.search(r"\bSELECT\b", bare, re.IGNORECASE):
+            return False, "WITH clause must contain a SELECT statement."
+
+    # ── 5. EXPLAIN is only allowed before SELECT/WITH ──
+    if first_word == "EXPLAIN":
+        rest = bare[len("EXPLAIN"):].strip()
+        rest_word = rest.split()[0].upper() if rest else ""
+        if rest_word not in ("SELECT", "WITH", "QUERY"):
+            return False, "EXPLAIN is only allowed with SELECT queries."
+
+    # ── 6. Neutralize string literals, then check for danger ──
+    safe_to_scan = _neutralize_string_literals(_strip_sql_comments(cleaned))
+    match = DANGEROUS_PATTERN.search(safe_to_scan)
+    if match:
+        return False, f"Query contains forbidden operation: {match.group().strip()}"
+
+    # ── 7. No multiple statements ──
+    # Count semicolons OUTSIDE of string literals
+    outside_strings = _neutralize_string_literals(cleaned)
+    if outside_strings.count(";") > 0:
+        return False, "Multiple statements are not allowed."
+
     return True, ""
 
 
-def add_limit(sql, limit=10000):
+def add_limit(sql: str, limit: int = 10000) -> str:
     if "LIMIT" not in sql.upper():
         sql = sql.rstrip().rstrip(";")
         sql += f" LIMIT {limit}"
@@ -60,12 +177,16 @@ def add_limit(sql, limit=10000):
 # QUERY EXECUTION
 # ═══════════════════════════════════════════════════════════════
 
-def execute_query(sql):
+def execute_query(sql: str):
+    # ── Clean LLM output ──
+    sql = _strip_markdown_sql(sql).strip().rstrip(";")
+
     valid, err = validate_sql(sql)
     if not valid:
         raise ValueError(err)
+
     sql = add_limit(sql)
-    conn = get_connection(readonly=True)
+    conn = get_connection(readonly=True)       # query_only = ON
     try:
         start = time.perf_counter()
         cursor = conn.execute(sql)
@@ -76,10 +197,14 @@ def execute_query(sql):
         conn.close()
 
 
-def execute_kpi_sql(sql):
+def execute_kpi_sql(sql: str):
+    # ── Clean LLM output ──
+    sql = _strip_markdown_sql(sql).strip().rstrip(";")
+
     valid, _ = validate_sql(sql)
     if not valid:
         return None
+
     conn = get_connection(readonly=True)
     try:
         cursor = conn.execute(sql)
@@ -203,40 +328,27 @@ def validate_sql_columns(
 # ═══════════════════════════════════════════════════════════════
 
 def _safe_clean_encoding(enc: str) -> str:
-    """
-    Clean encoding name. Never returns 'ascii'.
-    Works even if upload_service is not importable.
-    """
     if not enc:
         return "utf-8"
-
     clean = enc.split("(")[0].strip().lower()
-
-    # ASCII can't handle bytes > 127, upgrade to utf-8
     if clean in ("ascii", "us-ascii", "us_ascii", "ansi_x3.4-1968", "646"):
         return "utf-8"
-
-    # Validate
     import codecs
     try:
         codecs.lookup(clean)
         return clean
     except LookupError:
         pass
-
-    # Try original case
     original = enc.split("(")[0].strip()
     try:
         codecs.lookup(original)
         return original
     except LookupError:
         pass
-
     return "utf-8"
 
 
 def _safe_detect_encoding(filepath: str) -> str:
-    """Detect encoding from file, always returns valid name, never ascii."""
     try:
         from services.upload_service import detect_encoding, _clean_encoding_name
         with open(filepath, "rb") as f:
@@ -244,11 +356,9 @@ def _safe_detect_encoding(filepath: str) -> str:
         enc, _conf = detect_encoding(raw_sample)
         return _clean_encoding_name(enc)
     except ImportError:
-        # upload_service not available — do basic detection
         try:
             with open(filepath, "rb") as f:
                 raw = f.read(10000)
-            # Try utf-8 strict
             raw.decode("utf-8", errors="strict")
             return "utf-8"
         except UnicodeDecodeError:
@@ -258,20 +368,18 @@ def _safe_detect_encoding(filepath: str) -> str:
 
 
 def _safe_detect_delimiter(filepath: str, encoding: str) -> str:
-    """Detect delimiter from file, always returns valid delimiter."""
     try:
         from services.upload_service import detect_delimiter
         with open(filepath, "r", encoding=encoding, errors="replace") as f:
             text_sample = f.read(20000)
         return detect_delimiter(text_sample)
     except ImportError:
-        # upload_service not available — do basic detection
         try:
             with open(filepath, "r", encoding=encoding, errors="replace") as f:
                 sample = f.read(5000)
             counts = {",": sample.count(","), "\t": sample.count("\t"),
                       ";": sample.count(";"), "|": sample.count("|")}
-            best = max(counts, key=counts.get)  # type: ignore
+            best = max(counts, key=counts.get)
             return best if counts[best] > 0 else ","
         except Exception:
             return ","
@@ -279,30 +387,18 @@ def _safe_detect_delimiter(filepath: str, encoding: str) -> str:
         return ","
 
 
-def _try_read_csv(filepath: str, encoding: str, delimiter: str, chunk_size: int):
-    """
-    Try to create a chunked CSV reader with encoding fallback chain.
-    Returns (reader, encoding_used).
-    Raises ValueError if all encodings fail.
-    """
-    # Build list of encodings to try
+def _try_read_csv(filepath, encoding, delimiter, chunk_size):
     encodings_to_try = [encoding]
     for fb in ["utf-8", "utf-8-sig", "latin-1", "cp1252", "iso-8859-1"]:
         if fb not in encodings_to_try:
             encodings_to_try.append(fb)
-
     last_error = None
-
     for enc in encodings_to_try:
         try:
             reader = pd.read_csv(
-                filepath,
-                encoding=enc,
-                sep=delimiter,
-                chunksize=chunk_size,
-                on_bad_lines="skip",
-                engine="python",
-                dtype=str,
+                filepath, encoding=enc, sep=delimiter,
+                chunksize=chunk_size, on_bad_lines="skip",
+                engine="python", dtype=str,
             )
             if enc != encoding:
                 print(f"  Encoding fallback: {encoding} → {enc}")
@@ -310,52 +406,34 @@ def _try_read_csv(filepath: str, encoding: str, delimiter: str, chunk_size: int)
         except Exception as e:
             last_error = e
             continue
-
     raise ValueError(
-        f"Could not read file with any encoding. "
-        f"Tried: {', '.join(encodings_to_try)}. "
+        f"Could not read file. Tried: {', '.join(encodings_to_try)}. "
         f"Last error: {last_error}"
     )
 
 
-def _try_read_csv_preview(filepath: str, encoding: str, delimiter: str, nrows: int = 100):
-    """
-    Try to read CSV preview with encoding fallback chain.
-    Returns (dataframe, encoding_used).
-    Raises ValueError if all encodings fail.
-    """
+def _try_read_csv_preview(filepath, encoding, delimiter, nrows=100):
     encodings_to_try = [encoding]
     for fb in ["utf-8", "utf-8-sig", "latin-1", "cp1252", "iso-8859-1"]:
         if fb not in encodings_to_try:
             encodings_to_try.append(fb)
-
     errors_list = []
-
     for enc in encodings_to_try:
         try:
             df = pd.read_csv(
-                filepath,
-                encoding=enc,
-                sep=delimiter,
-                nrows=nrows,
-                on_bad_lines="skip",
-                engine="python",
+                filepath, encoding=enc, sep=delimiter,
+                nrows=nrows, on_bad_lines="skip", engine="python",
             )
             if df is not None and not df.empty:
                 return df, enc
         except Exception as e:
             errors_list.append(f"{enc}: {e}")
             continue
-
-    raise ValueError(
-        f"Could not read CSV with any encoding. "
-        f"Tried: {'; '.join(errors_list)}"
-    )
+    raise ValueError(f"Could not read CSV. Tried: {'; '.join(errors_list)}")
 
 
 # ═══════════════════════════════════════════════════════════════
-# CSV LOADING — CHUNKED, AUTO-ENCODING, AUTO-DELIMITER
-# No row limit — only file size limit (100MB)
+# CSV LOADING
 # ═══════════════════════════════════════════════════════════════
 
 def load_csv_to_db(
@@ -364,25 +442,11 @@ def load_csv_to_db(
     encoding: Optional[str] = None,
     delimiter: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Load CSV/TSV into SQLite.
-    - Auto-detects encoding (never uses 'ascii')
-    - Auto-detects delimiter
-    - Loads in chunks of 50,000 rows for memory efficiency
-    - No row limit — handles any number of rows up to 100MB file size
-    - Auto-converts numeric columns
-    - Creates indexes on text columns
-    - Encoding fallback chain on failure
-    """
     safe_name = re.sub(r"[^\w]", "_", table_name)
-
-    # ── Detect encoding (never returns ascii) ──
     if encoding is None:
         encoding = _safe_detect_encoding(filepath)
     else:
         encoding = _safe_clean_encoding(encoding)
-
-    # ── Detect delimiter ──
     if delimiter is None:
         delimiter = _safe_detect_delimiter(filepath, encoding)
 
@@ -395,17 +459,11 @@ def load_csv_to_db(
     try:
         total_rows = 0
         chunk_num = 0
-
-        # ── Get reader with automatic fallback ──
         reader, actual_encoding = _try_read_csv(
             filepath, encoding, delimiter, CHUNK
         )
-
-        # ── Process chunks ──
         for chunk in reader:
             chunk_num += 1
-
-            # ── Clean column names ──
             clean_cols = []
             seen_cols: set = set()
             for col in chunk.columns:
@@ -419,15 +477,10 @@ def load_csv_to_db(
                     counter += 1
                 seen_cols.add(c.lower())
                 clean_cols.append(c)
-
             chunk.columns = clean_cols
-
-            # ── Drop completely empty rows ──
             chunk = chunk.dropna(how="all")
             if chunk.empty:
                 continue
-
-            # ── Auto-convert numeric columns ──
             for col in chunk.columns:
                 try:
                     numeric = pd.to_numeric(chunk[col], errors="coerce")
@@ -439,13 +492,9 @@ def load_csv_to_db(
                             chunk[col] = numeric
                 except Exception:
                     pass
-
-            # ── Write to SQLite ──
             mode = "replace" if chunk_num == 1 else "append"
             chunk.to_sql(safe_name, conn, if_exists=mode, index=False)
             total_rows += len(chunk)
-
-            # Commit and log periodically
             if chunk_num % 20 == 0:
                 conn.commit()
                 print(f"  … loaded {total_rows:,} rows ({chunk_num} chunks)")
@@ -453,10 +502,8 @@ def load_csv_to_db(
         if total_rows == 0:
             raise ValueError("No data rows found in file after parsing")
 
-        # ── Final commit ──
         conn.commit()
 
-        # ── Create indexes on text columns ──
         try:
             cols_info = conn.execute(
                 f"PRAGMA table_info('{safe_name}')"
@@ -484,9 +531,7 @@ def load_csv_to_db(
             f"({chunk_num} chunks, encoding={actual_encoding}, "
             f"delimiter={delim_display})"
         )
-
         return get_schema()
-
     finally:
         conn.close()
 
@@ -500,27 +545,16 @@ def preview_csv(
     encoding: Optional[str] = None,
     delimiter: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Preview CSV with auto encoding/delimiter detection.
-    Reads only first 100 rows for speed.
-    Never uses 'ascii' encoding.
-    """
-    # ── Detect encoding (never ascii) ──
     if encoding is None:
         encoding = _safe_detect_encoding(filepath)
     else:
         encoding = _safe_clean_encoding(encoding)
-
-    # ── Detect delimiter ──
     if delimiter is None:
         delimiter = _safe_detect_delimiter(filepath, encoding)
 
-    # ── Read preview with fallback ──
     df, actual_encoding = _try_read_csv_preview(
         filepath, encoding, delimiter, nrows=100
     )
-
-    # ── Count total rows (fast binary newline count) ──
     try:
         total_lines = 0
         with open(filepath, "rb") as f:
@@ -533,7 +567,6 @@ def preview_csv(
     except Exception:
         total_lines = len(df)
 
-    # ── Build column info ──
     columns = []
     for col in df.columns:
         dtype = str(df[col].dtype)
@@ -550,7 +583,6 @@ def preview_csv(
         columns.append({"name": str(col), "type": col_type})
 
     sample = df.head(5).fillna("").to_dict(orient="records")
-
     return {
         "row_count": total_lines,
         "columns": columns,
@@ -595,19 +627,16 @@ def profile_table(table_name: str) -> Dict[str, Any]:
         cols_raw = conn.execute(
             f"PRAGMA table_info('{safe}')"
         ).fetchall()
-
         for ci in cols_raw:
             name, dtype = ci[1], ci[2].upper()
             if name in {"row_id", "index"}:
                 continue
-
             if any(
                 d in name.lower()
                 for d in {"date", "time", "created", "updated", "published"}
             ):
                 profile["date_columns"].append(name)
                 continue
-
             if any(t in dtype for t in {"INT", "REAL", "FLOAT", "NUM"}):
                 try:
                     row = conn.execute(
@@ -617,8 +646,7 @@ def profile_table(table_name: str) -> Dict[str, Any]:
                     ).fetchone()
                     profile["numeric_columns"].append({
                         "name": name,
-                        "min": row[0],
-                        "max": row[1],
+                        "min": row[0], "max": row[1],
                         "avg": round(row[2], 2) if row[2] else None,
                         "distinct": row[3],
                     })
@@ -635,16 +663,13 @@ def profile_table(table_name: str) -> Dict[str, Any]:
                         f'SELECT COUNT(DISTINCT "{name}") FROM "{safe}"'
                     ).fetchone()[0]
                     profile["categorical_columns"].append({
-                        "name": name,
-                        "distinct": dist,
+                        "name": name, "distinct": dist,
                         "top_values": [
-                            {"value": str(r[0]), "count": r[1]}
-                            for r in top
+                            {"value": str(r[0]), "count": r[1]} for r in top
                         ],
                     })
                 except Exception:
                     profile["categorical_columns"].append({"name": name})
-
     except Exception as e:
         print(f"Profiling failed for {safe}: {e}")
     finally:
@@ -657,13 +682,10 @@ def generate_starter_questions(profile: Dict[str, Any]) -> List[str]:
     cats = profile.get("categorical_columns", [])
     nums = profile.get("numeric_columns", [])
     dates = profile.get("date_columns", [])
-
     if cats:
         qs.append(f"Show the distribution of records by {cats[0]['name']}")
     if nums and cats:
-        qs.append(
-            f"What is the average {nums[0]['name']} by {cats[0]['name']}?"
-        )
+        qs.append(f"What is the average {nums[0]['name']} by {cats[0]['name']}?")
     if dates and nums:
         qs.append(f"Show the trend of {nums[0]['name']} over time")
     if len(nums) >= 2:
